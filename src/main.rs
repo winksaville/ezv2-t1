@@ -1,13 +1,16 @@
-use std::error::Error;
+use std::{error::Error, path::Path};
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use serde::Deserialize;
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 
 const BROKER_IP: &str = "192.168.1.195";
 const BROKER_PORT: u16 = 1883;
 const TOPIC_BASE: &str = "EZPlugV2_743EEC";
+
+// https://tasmota.github.io/docs/Peripherals/#update-interval
+const TELE_PERIOD: u64 = 10; // seconds 10..3600
 
 #[derive(Debug, Deserialize)]
 struct Wifi {
@@ -77,12 +80,14 @@ struct TeleSensor {
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
-    // ---------- DB SETUP ----------
-    let pool: SqlitePool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect("sqlite:ezplug.db")
-        .await?;
+    println!("ezv2: SQLite Logger starting");
 
+    println!("ezv2: connect_to_db(ezplug.db)");
+    let pool = connect_to_db("ezplug.db").await?;
+    println!("ezv2: connected to ezplug.db");
+
+
+    println!("Create/connect to state table");
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS state (
@@ -104,6 +109,8 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     .execute(&pool)
     .await?;
 
+    // Create/connect sensor table
+    println!("Create/connect to sensor table");
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS sensor (
@@ -127,6 +134,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     // ---------- MQTT SETUP ----------
+    println!("Setting up MQTT client");
     let mut mqttoptions =
         MqttOptions::new("ezplugv2_sqlite_logger", BROKER_IP, BROKER_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
@@ -141,16 +149,17 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     println!("Subscribed to tele/{TOPIC_BASE}/STATE and tele/{TOPIC_BASE}/SENSOR");
 
-    // Set TelePeriod to 5 seconds
+    // Set TelePeriod to TELE_PERIOD seconds
+    println!("Setting TelePeriod to {TELE_PERIOD} seconds");
     client
         .publish(
             format!("cmnd/{TOPIC_BASE}/TelePeriod"),
             QoS::AtLeastOnce,
             false,
-            "5",
+            "{TELE_PERIOD}",
         )
         .await?;
-    println!("TelePeriod command sent (5 seconds)");
+    println!("TelePeriod command sent ({TELE_PERIOD} seconds)");
 
     let state_topic = format!("tele/{TOPIC_BASE}/STATE");
     let sensor_topic = format!("tele/{TOPIC_BASE}/SENSOR");
@@ -214,6 +223,15 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 // ---------- DB HELPERS ----------
+async fn connect_to_db(
+    filename: impl AsRef<Path>,
+) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::new()
+        .filename(filename)
+        .create_if_missing(true);
+
+    SqlitePool::connect_with(options).await
+}
 
 async fn save_state(pool: &SqlitePool, s: &TeleState) -> Result<(), sqlx::Error> {
     sqlx::query(
