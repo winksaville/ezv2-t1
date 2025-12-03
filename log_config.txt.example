@@ -1,0 +1,32 @@
+# Log Configuration Examples
+# This file is automatically watched - changes take effect immediately!
+# All non-comment, non-empty lines are concatenated together.
+
+# Basic log levels (use one):
+info
+# debug
+# trace
+# warn
+# error
+
+# ===== ADVANCED EXAMPLES =====
+# You can split complex filters across multiple lines for readability:
+
+# Example 1: Debug for app, warn for MQTT library
+# ezv2_t1=debug,
+# rumqttc=warn
+
+# Example 2: Info generally, but debug for SENSOR topic only
+# info,
+# ezv2_t1[{topic="tele/EZPlugV2_743EEC/SENSOR"}]=debug
+
+# Example 3: Show only STATE topic messages
+# ezv2_t1[{topic="tele/EZPlugV2_743EEC/STATE"}]=debug
+
+# Example 4: Show only SENSOR topic messages
+# ezv2_t1[{topic="tele/EZPlugV2_743EEC/SENSOR"}]=debug
+
+# Example 5: Multi-line complex filter
+# ezv2_t1=debug,
+# rumqttc=warn,
+# sqlx=warn

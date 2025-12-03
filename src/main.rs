@@ -1,11 +1,14 @@
 // Created with ChatGPT 5.1
 //   https://chatgpt.com/share/6930bbf3-a5a8-800c-a89d-3719a0a5f58a
-use std::{error::Error, path::Path};
+use std::{error::Error, fs, path::Path};
 use std::time::Duration;
 
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use serde::Deserialize;
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+use tracing::{debug, error, info, info_span, warn};
+use tracing_subscriber::{reload, EnvFilter, prelude::*};
 
 const BROKER_IP: &str = "192.168.1.195";
 const BROKER_PORT: u16 = 1883;
@@ -82,14 +85,89 @@ struct TeleSensor {
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
-    println!("ezv2: SQLite Logger starting");
+    // Initialize tracing subscriber with reloadable filter
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    println!("ezv2: connect_to_db(ezplug.db)");
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Watch log_config.txt for changes and reload configuration
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+    // Spawn file watcher in a separate thread (notify requires blocking)
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Handle::current();
+
+        let mut watcher = RecommendedWatcher::new(
+            move |res: Result<NotifyEvent, notify::Error>| {
+                if let Ok(event) = res {
+                    // Trigger reload on modify or create events
+                    if event.kind.is_modify() || event.kind.is_create() {
+                        let _ = rt.block_on(async {
+                            tx.send(()).await
+                        });
+                    }
+                }
+            },
+            Config::default(),
+        ).expect("Failed to create file watcher");
+
+        watcher.watch(
+            std::path::Path::new("log_config.txt"),
+            RecursiveMode::NonRecursive
+        ).expect("Failed to watch log_config.txt");
+
+        // Keep watcher alive
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+
+    // Handle reload events
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            // Read log level from file
+            match fs::read_to_string("log_config.txt") {
+                Ok(content) => {
+                    // Collect all non-empty, non-comment lines and concatenate them
+                    let level: String = content
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    if !level.is_empty() {
+                        let new_filter = EnvFilter::new(&level);
+
+                        match reload_handle.reload(new_filter) {
+                            Ok(_) => info!("Log configuration reloaded from log_config.txt: {}", level),
+                            Err(e) => error!("Failed to reload log configuration: {e}"),
+                        }
+                    } else {
+                        warn!("log_config.txt contains no valid configuration (only comments/empty lines)");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read log_config.txt: {e}");
+                }
+            }
+        }
+    });
+
+    info!("ezv2: SQLite Logger starting");
+
+    info!("ezv2: connect_to_db(ezplug.db)");
     let pool = connect_to_db("ezplug.db").await?;
-    println!("ezv2: connected to ezplug.db");
+    info!("ezv2: connected to ezplug.db");
 
 
-    println!("Create/connect to state table");
+    info!("Create/connect to state table");
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS state (
@@ -112,7 +190,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     // Create/connect sensor table
-    println!("Create/connect to sensor table");
+    info!("Create/connect to sensor table");
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS sensor (
@@ -136,7 +214,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     // ---------- MQTT SETUP ----------
-    println!("Setting up MQTT client");
+    info!("Setting up MQTT client");
     let mut mqttoptions =
         MqttOptions::new("ezplugv2_sqlite_logger", BROKER_IP, BROKER_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
@@ -149,10 +227,10 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     client
         .subscribe(format!("tele/{TOPIC_BASE}/SENSOR"), QoS::AtMostOnce)
         .await?;
-    println!("Subscribed to tele/{TOPIC_BASE}/STATE and tele/{TOPIC_BASE}/SENSOR");
+    info!("Subscribed to tele/{TOPIC_BASE}/STATE and tele/{TOPIC_BASE}/SENSOR");
 
     // Set TelePeriod to TELE_PERIOD seconds
-    println!("Setting TelePeriod to {TELE_PERIOD} seconds");
+    info!("Setting TelePeriod to {TELE_PERIOD} seconds");
     client
         .publish(
             format!("cmnd/{TOPIC_BASE}/TelePeriod"),
@@ -161,7 +239,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             "{TELE_PERIOD}",
         )
         .await?;
-    println!("TelePeriod command sent ({TELE_PERIOD} seconds)");
+    info!("TelePeriod command sent ({TELE_PERIOD} seconds)");
 
     let state_topic = format!("tele/{TOPIC_BASE}/STATE");
     let sensor_topic = format!("tele/{TOPIC_BASE}/SENSOR");
@@ -175,27 +253,30 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 let topic = p.topic.clone();
                 let payload_str = String::from_utf8_lossy(&p.payload);
 
+                // Create a span for this message processing
+                let _span = info_span!("mqtt_message", topic = %topic).entered();
+
                 if topic == state_topic {
                     match serde_json::from_str::<TeleState>(&payload_str) {
                         Ok(state) => {
                             if let Err(e) = save_state(&pool, &state).await {
-                                eprintln!("Failed to save STATE: {e}");
+                                error!("Failed to save STATE: {e}");
                             } else {
-                                println!("STATE saved: {}", state.time);
+                                debug!("STATE saved: {}", state.time);
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to parse STATE JSON: {e}");
-                            eprintln!("Payload: {payload_str}");
+                            error!("Failed to parse STATE JSON: {e}");
+                            error!("Payload: {payload_str}");
                         }
                     }
                 } else if topic == sensor_topic {
                     match serde_json::from_str::<TeleSensor>(&payload_str) {
                         Ok(sensor) => {
                             if let Err(e) = save_sensor(&pool, &sensor).await {
-                                eprintln!("Failed to save SENSOR: {e}");
+                                error!("Failed to save SENSOR: {e}");
                             } else {
-                                println!(
+                                debug!(
                                     "SENSOR saved: {}  P={}W V={}V",
                                     sensor.time,
                                     sensor.energy.power,
@@ -204,20 +285,20 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to parse SENSOR JSON: {e}");
-                            eprintln!("Payload: {payload_str}");
+                            error!("Failed to parse SENSOR JSON: {e}");
+                            error!("Payload: {payload_str}");
                         }
                     }
                 } else {
                     // Shouldn't happen with this subscribe list, but harmless
-                    println!("Other topic {} => {}", topic, payload_str);
+                    warn!("Other topic {} => {}", topic, payload_str);
                 }
             }
             Ok(_) => {
                 // ignore pings/acks etc
             }
             Err(e) => {
-                eprintln!("MQTT error: {e}");
+                error!("MQTT error: {e}");
                 return Err(e.into());
             }
         }
