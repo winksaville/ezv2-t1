@@ -1,12 +1,15 @@
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
-use sqlx::sqlite::SqlitePool;
+use std::error::Error;
 use std::time::Duration;
+
+use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use serde::Deserialize;
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
 const BROKER_IP: &str = "192.168.1.195";
 const BROKER_PORT: u16 = 1883;
 const TOPIC_BASE: &str = "EZPlugV2_743EEC";
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Wifi {
     #[serde(rename = "SSId")]
     ssid: String,
@@ -14,7 +17,7 @@ struct Wifi {
     rssi: i32,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct TeleState {
     #[serde(rename = "Time")]
     time: String,
@@ -38,7 +41,7 @@ struct TeleState {
     wifi: Wifi,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Energy {
     #[serde(rename = "TotalStartTime")]
     total_start_time: String,
@@ -64,7 +67,7 @@ struct Energy {
     current: f64,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct TeleSensor {
     #[serde(rename = "Time")]
     time: String,
@@ -73,9 +76,12 @@ struct TeleSensor {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> Result<(), Box<dyn Error>> {
     // ---------- DB SETUP ----------
-    let pool = SqlitePool::connect("sqlite:ezplug.db").await?;
+    let pool: SqlitePool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect("sqlite:ezplug.db")
+        .await?;
 
     sqlx::query(
         r#"
@@ -192,22 +198,22 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 } else {
+                    // Shouldn't happen with this subscribe list, but harmless
                     println!("Other topic {} => {}", topic, payload_str);
                 }
             }
             Ok(_) => {
-                // ignore ping/acks
+                // ignore pings/acks etc
             }
             Err(e) => {
                 eprintln!("MQTT error: {e}");
-                break;
+                return Err(e.into());
             }
         }
     }
-
-    // Not reached, but keeps type checker happy if you want:
-    // Ok(())
 }
+
+// ---------- DB HELPERS ----------
 
 async fn save_state(pool: &SqlitePool, s: &TeleState) -> Result<(), sqlx::Error> {
     sqlx::query(
