@@ -40,7 +40,27 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("Sent STATUS 0 command to cmnd/{TOPIC_BASE}/STATUS");
 
-    // 4. Process incoming messages and print those from our plug
+    // set telemetry period to 5 seconds
+    client
+        .publish(
+            format!("cmnd/{TOPIC_BASE}/TelePeriod"),
+            QoS::AtLeastOnce,
+            false,
+            "5",
+        )
+        .await?;
+    println!("TelePeriod set to 5 seconds");
+
+    // Subscribe to STATE
+    client
+        .subscribe(format!("tele/{TOPIC_BASE}/STATE"), QoS::AtMostOnce)
+        .await?;
+    // Subscribe to SENSOR
+    client
+        .subscribe(format!("tele/{TOPIC_BASE}/SENSOR"), QoS::AtMostOnce)
+        .await?;
+
+    // Process incoming messages and print those from our plug
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(p))) => {
@@ -49,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(_other) => {
                 // ignore pings/acks/etc
+                //println!("Received other event: {:?}", _other);
             }
             Err(e) => {
                 eprintln!("MQTT error: {e}");
