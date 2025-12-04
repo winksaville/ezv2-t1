@@ -10,13 +10,33 @@ use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::{EnvFilter, prelude::*, reload};
 
-const BROKER_IP: &str = "192.168.1.195";
-const BROKER_PORT: u16 = 1883;
-const TOPIC_BASE: &str = "EZPlugV2_743EEC";
-const CLIENT_ID: &str = "ezplugv2_sqlite_logger_dev";
+const CONFIG_FILE: &str = "ezv2-config.toml";
 
-// https://tasmota.github.io/docs/Peripherals/#update-interval
-const TELE_PERIOD: u64 = 10; // seconds 10..3600
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    mqtt: MqttConfig,
+    database: DatabaseConfig,
+    logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct MqttConfig {
+    broker_ip: String,
+    broker_port: u16,
+    topic_base: String,
+    client_id: String,
+    tele_period: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatabaseConfig {
+    filename: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoggingConfig {
+    config_file: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct Wifi {
@@ -86,20 +106,33 @@ struct TeleSensor {
 
 type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
+fn load_config() -> Result<AppConfig, Box<dyn Error>> {
+    let content = fs::read_to_string(CONFIG_FILE)
+        .map_err(|e| format!("Failed to read {CONFIG_FILE}: {e}"))?;
+    let config: AppConfig =
+        toml::from_str(&content).map_err(|e| format!("Failed to parse {CONFIG_FILE}: {e}"))?;
+    Ok(config)
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logging with dynamic reload support
     let reload_handle = init_tracing();
-    spawn_config_watcher(reload_handle);
+
+    // Load configuration
+    let config = load_config()?;
+    info!("Loaded configuration from {CONFIG_FILE}");
+
+    spawn_config_watcher(reload_handle, config.logging.config_file.clone());
 
     info!("ezv2: SQLite Logger starting");
 
     // Set up database and MQTT connections
-    let pool = init_db("ezplug.db").await?;
-    let (_client, mut eventloop) = setup_mqtt().await?;
+    let pool = init_db(&config.database.filename).await?;
+    let (_client, mut eventloop) = setup_mqtt(&config.mqtt).await?;
 
-    let state_topic = format!("tele/{TOPIC_BASE}/STATE");
-    let sensor_topic = format!("tele/{TOPIC_BASE}/SENSOR");
+    let state_topic = format!("tele/{}/STATE", config.mqtt.topic_base);
+    let sensor_topic = format!("tele/{}/SENSOR", config.mqtt.topic_base);
 
     // Main event loop: process incoming MQTT messages
     loop {
@@ -142,10 +175,18 @@ fn init_tracing() -> ReloadHandle {
     reload_handle
 }
 
-/// Watch log_config.txt for changes and reload the tracing filter when modified.
+/// Watch log config file for changes and reload the tracing filter when modified.
 /// Spawns a file watcher thread and a tokio task to handle reload events.
-fn spawn_config_watcher(reload_handle: ReloadHandle) {
+fn spawn_config_watcher(reload_handle: ReloadHandle, log_config_file: String) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(10);
+
+    let log_config_filename = Path::new(&log_config_file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&log_config_file)
+        .to_string();
+
+    let watch_filename = log_config_filename.clone();
 
     // Spawn file watcher in a separate thread (notify requires blocking)
     std::thread::spawn(move || {
@@ -153,11 +194,11 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<NotifyEvent, notify::Error>| {
                 if let Ok(event) = res {
-                    // Check if event is related to log_config.txt
+                    // Check if event is related to log config file
                     let is_log_config = event.paths.iter().any(|p| {
                         p.file_name()
                             .and_then(|n| n.to_str())
-                            .map(|n| n == "log_config.txt")
+                            .map(|n| n == watch_filename)
                             .unwrap_or(false)
                     });
 
@@ -197,7 +238,7 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             // Read log level from file
-            match fs::read_to_string("log_config.txt") {
+            match fs::read_to_string(&log_config_file) {
                 Ok(content) => {
                     // Collect all non-empty, non-comment lines and concatenate them
                     let level: String = content
@@ -212,20 +253,24 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
 
                         match reload_handle.reload(new_filter) {
                             Ok(_) => {
-                                info!("Log configuration reloaded from log_config.txt: {}", level)
+                                info!(
+                                    "Log configuration reloaded from {}: {}",
+                                    log_config_file, level
+                                )
                             }
                             Err(e) => error!("Failed to reload log configuration: {e}"),
                         }
                     } else {
                         warn!(
-                            "log_config.txt contains no valid configuration (only comments/empty lines)"
+                            "{} contains no valid configuration (only comments/empty lines)",
+                            log_config_file
                         );
                     }
                 }
                 Err(e) => {
                     // If file doesn't exist, just ignore (keep current log level)
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        error!("Failed to read log_config.txt: {e}");
+                        error!("Failed to read {}: {e}", log_config_file);
                     }
                 }
             }
@@ -291,32 +336,35 @@ async fn init_db(filename: impl AsRef<Path>) -> Result<SqlitePool, Box<dyn Error
 }
 
 /// Set up MQTT client, subscribe to topics, and configure telemetry period.
-async fn setup_mqtt() -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
+async fn setup_mqtt(config: &MqttConfig) -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
     info!("Setting up MQTT client");
-    let mut mqttoptions = MqttOptions::new(CLIENT_ID, BROKER_IP, BROKER_PORT);
+    let mut mqttoptions =
+        MqttOptions::new(&config.client_id, &config.broker_ip, config.broker_port);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
+    let topic_base = &config.topic_base;
     client
-        .subscribe(format!("tele/{TOPIC_BASE}/STATE"), QoS::AtMostOnce)
+        .subscribe(format!("tele/{topic_base}/STATE"), QoS::AtMostOnce)
         .await?;
     client
-        .subscribe(format!("tele/{TOPIC_BASE}/SENSOR"), QoS::AtMostOnce)
+        .subscribe(format!("tele/{topic_base}/SENSOR"), QoS::AtMostOnce)
         .await?;
-    info!("Subscribed to tele/{TOPIC_BASE}/STATE and tele/{TOPIC_BASE}/SENSOR");
+    info!("Subscribed to tele/{topic_base}/STATE and tele/{topic_base}/SENSOR");
 
-    // Set TelePeriod to TELE_PERIOD seconds
-    info!("Setting TelePeriod to {TELE_PERIOD} seconds");
+    // Set TelePeriod
+    let tele_period = config.tele_period;
+    info!("Setting TelePeriod to {tele_period} seconds");
     client
         .publish(
-            format!("cmnd/{TOPIC_BASE}/TelePeriod"),
+            format!("cmnd/{topic_base}/TelePeriod"),
             QoS::AtLeastOnce,
             false,
-            "{TELE_PERIOD}",
+            tele_period.to_string(),
         )
         .await?;
-    info!("TelePeriod command sent ({TELE_PERIOD} seconds)");
+    info!("TelePeriod command sent ({tele_period} seconds)");
 
     Ok((client, eventloop))
 }
