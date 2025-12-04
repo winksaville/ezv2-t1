@@ -1,18 +1,19 @@
 // Created with ChatGPT 5.1
 //   https://chatgpt.com/share/6930bbf3-a5a8-800c-a89d-3719a0a5f58a
-use std::{error::Error, fs, path::Path};
 use std::time::Duration;
+use std::{error::Error, fs, path::Path};
 
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent};
+use notify::{Config, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use rumqttc::{AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS};
 use serde::Deserialize;
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tracing::{debug, error, info, info_span, warn};
-use tracing_subscriber::{reload, EnvFilter, prelude::*};
+use tracing_subscriber::{EnvFilter, prelude::*, reload};
 
 const BROKER_IP: &str = "192.168.1.195";
 const BROKER_PORT: u16 = 1883;
 const TOPIC_BASE: &str = "EZPlugV2_743EEC";
+const CLIENT_ID: &str = "ezplugv2_sqlite_logger_dev";
 
 // https://tasmota.github.io/docs/Peripherals/#update-interval
 const TELE_PERIOD: u64 = 10; // seconds 10..3600
@@ -129,8 +130,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 /// Initialize tracing subscriber with a reloadable filter layer.
 /// Returns a handle that can be used to dynamically change the log level.
 fn init_tracing() -> ReloadHandle {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let (filter_layer, reload_handle) = reload::Layer::new(filter);
 
@@ -165,7 +165,12 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
                         // Trigger reload on close-write, create, or remove events
                         // Note: We use Access(Close(Write)) instead of Modify to avoid duplicate events
                         // from truncate + write generating two separate Modify(Data) inotify events
-                        let is_close_write = matches!(event.kind, notify::EventKind::Access(notify::event::AccessKind::Close(notify::event::AccessMode::Write)));
+                        let is_close_write = matches!(
+                            event.kind,
+                            notify::EventKind::Access(notify::event::AccessKind::Close(
+                                notify::event::AccessMode::Write
+                            ))
+                        );
                         if is_close_write || event.kind.is_create() || event.kind.is_remove() {
                             let _ = tx_clone.blocking_send(());
                         }
@@ -173,14 +178,14 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
                 }
             },
             Config::default(),
-        ).expect("Failed to create file watcher");
+        )
+        .expect("Failed to create file watcher");
 
         // Watch the current directory instead of the file directly
         // This allows us to detect file creation/deletion
-        watcher.watch(
-            std::path::Path::new("."),
-            RecursiveMode::NonRecursive
-        ).expect("Failed to watch current directory");
+        watcher
+            .watch(std::path::Path::new("."), RecursiveMode::NonRecursive)
+            .expect("Failed to watch current directory");
 
         // Keep watcher alive
         loop {
@@ -206,11 +211,15 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
                         let new_filter = EnvFilter::new(&level);
 
                         match reload_handle.reload(new_filter) {
-                            Ok(_) => info!("Log configuration reloaded from log_config.txt: {}", level),
+                            Ok(_) => {
+                                info!("Log configuration reloaded from log_config.txt: {}", level)
+                            }
                             Err(e) => error!("Failed to reload log configuration: {e}"),
                         }
                     } else {
-                        warn!("log_config.txt contains no valid configuration (only comments/empty lines)");
+                        warn!(
+                            "log_config.txt contains no valid configuration (only comments/empty lines)"
+                        );
                     }
                 }
                 Err(e) => {
@@ -284,8 +293,7 @@ async fn init_db(filename: impl AsRef<Path>) -> Result<SqlitePool, Box<dyn Error
 /// Set up MQTT client, subscribe to topics, and configure telemetry period.
 async fn setup_mqtt() -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
     info!("Setting up MQTT client");
-    let mut mqttoptions =
-        MqttOptions::new("ezplugv2_sqlite_logger", BROKER_IP, BROKER_PORT);
+    let mut mqttoptions = MqttOptions::new(CLIENT_ID, BROKER_IP, BROKER_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
@@ -339,9 +347,7 @@ async fn handle_sensor_message(payload_str: &str, pool: &SqlitePool) {
             } else {
                 debug!(
                     "SENSOR saved: {}  P={}W V={}V",
-                    sensor.time,
-                    sensor.energy.power,
-                    sensor.energy.voltage
+                    sensor.time, sensor.energy.power, sensor.energy.voltage
                 );
             }
         }
