@@ -4,7 +4,7 @@ use std::{error::Error, fs, path::Path};
 use std::time::Duration;
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent};
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use rumqttc::{AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS};
 use serde::Deserialize;
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tracing::{debug, error, info, info_span, warn};
@@ -83,9 +83,47 @@ struct TeleSensor {
     energy: Energy,
 }
 
+type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize tracing subscriber with reloadable filter
+    let reload_handle = init_tracing();
+    spawn_config_watcher(reload_handle);
+
+    info!("ezv2: SQLite Logger starting");
+
+    let pool = init_db("ezplug.db").await?;
+    let (_client, mut eventloop) = setup_mqtt().await?;
+
+    let state_topic = format!("tele/{TOPIC_BASE}/STATE");
+    let sensor_topic = format!("tele/{TOPIC_BASE}/SENSOR");
+
+    loop {
+        match eventloop.poll().await {
+            Ok(Event::Incoming(Incoming::Publish(p))) => {
+                let topic = p.topic.clone();
+                let payload_str = String::from_utf8_lossy(&p.payload);
+
+                let _span = info_span!("mqtt_message", topic = %topic).entered();
+
+                if topic == state_topic {
+                    handle_state_message(&payload_str, &pool).await;
+                } else if topic == sensor_topic {
+                    handle_sensor_message(&payload_str, &pool).await;
+                } else {
+                    warn!("Other topic {} => {}", topic, payload_str);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("MQTT error: {e}");
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+fn init_tracing() -> ReloadHandle {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -96,12 +134,15 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Watch log_config.txt for changes and reload configuration
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    reload_handle
+}
+
+fn spawn_config_watcher(reload_handle: ReloadHandle) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(10);
 
     // Spawn file watcher in a separate thread (notify requires blocking)
-    let tx_clone = tx.clone();
     std::thread::spawn(move || {
+        let tx_clone = tx.clone();
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<NotifyEvent, notify::Error>| {
                 if let Ok(event) = res {
@@ -174,13 +215,15 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     });
+}
 
-    info!("ezv2: SQLite Logger starting");
-
-    info!("ezv2: connect_to_db(ezplug.db)");
-    let pool = connect_to_db("ezplug.db").await?;
-    info!("ezv2: connected to ezplug.db");
-
+async fn init_db(filename: impl AsRef<Path>) -> Result<SqlitePool, Box<dyn Error>> {
+    info!("ezv2: connect_to_db({})", filename.as_ref().display());
+    let options = SqliteConnectOptions::new()
+        .filename(&filename)
+        .create_if_missing(true);
+    let pool = SqlitePool::connect_with(options).await?;
+    info!("ezv2: connected to {}", filename.as_ref().display());
 
     info!("Create/connect to state table");
     sqlx::query(
@@ -204,7 +247,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     .execute(&pool)
     .await?;
 
-    // Create/connect sensor table
     info!("Create/connect to sensor table");
     sqlx::query(
         r#"
@@ -228,13 +270,16 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     .execute(&pool)
     .await?;
 
-    // ---------- MQTT SETUP ----------
+    Ok(pool)
+}
+
+async fn setup_mqtt() -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
     info!("Setting up MQTT client");
     let mut mqttoptions =
         MqttOptions::new("ezplugv2_sqlite_logger", BROKER_IP, BROKER_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
 
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+    let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
     client
         .subscribe(format!("tele/{TOPIC_BASE}/STATE"), QoS::AtMostOnce)
@@ -256,79 +301,44 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     info!("TelePeriod command sent ({TELE_PERIOD} seconds)");
 
-    let state_topic = format!("tele/{TOPIC_BASE}/STATE");
-    let sensor_topic = format!("tele/{TOPIC_BASE}/SENSOR");
+    Ok((client, eventloop))
+}
 
-    let pool = pool.clone();
-
-    // ---------- MAIN LOOP ----------
-    loop {
-        match eventloop.poll().await {
-            Ok(Event::Incoming(Incoming::Publish(p))) => {
-                let topic = p.topic.clone();
-                let payload_str = String::from_utf8_lossy(&p.payload);
-
-                // Create a span for this message processing
-                let _span = info_span!("mqtt_message", topic = %topic).entered();
-
-                if topic == state_topic {
-                    match serde_json::from_str::<TeleState>(&payload_str) {
-                        Ok(state) => {
-                            if let Err(e) = save_state(&pool, &state).await {
-                                error!("Failed to save STATE: {e}");
-                            } else {
-                                debug!("STATE saved: {}", state.time);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to parse STATE JSON: {e}");
-                            error!("Payload: {payload_str}");
-                        }
-                    }
-                } else if topic == sensor_topic {
-                    match serde_json::from_str::<TeleSensor>(&payload_str) {
-                        Ok(sensor) => {
-                            if let Err(e) = save_sensor(&pool, &sensor).await {
-                                error!("Failed to save SENSOR: {e}");
-                            } else {
-                                debug!(
-                                    "SENSOR saved: {}  P={}W V={}V",
-                                    sensor.time,
-                                    sensor.energy.power,
-                                    sensor.energy.voltage
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to parse SENSOR JSON: {e}");
-                            error!("Payload: {payload_str}");
-                        }
-                    }
-                } else {
-                    // Shouldn't happen with this subscribe list, but harmless
-                    warn!("Other topic {} => {}", topic, payload_str);
-                }
+async fn handle_state_message(payload_str: &str, pool: &SqlitePool) {
+    match serde_json::from_str::<TeleState>(payload_str) {
+        Ok(state) => {
+            if let Err(e) = save_state(pool, &state).await {
+                error!("Failed to save STATE: {e}");
+            } else {
+                debug!("STATE saved: {}", state.time);
             }
-            Ok(_) => {
-                // ignore pings/acks etc
-            }
-            Err(e) => {
-                error!("MQTT error: {e}");
-                return Err(e.into());
-            }
+        }
+        Err(e) => {
+            error!("Failed to parse STATE JSON: {e}");
+            error!("Payload: {payload_str}");
         }
     }
 }
 
-// ---------- DB HELPERS ----------
-async fn connect_to_db(
-    filename: impl AsRef<Path>,
-) -> Result<SqlitePool, sqlx::Error> {
-    let options = SqliteConnectOptions::new()
-        .filename(filename)
-        .create_if_missing(true);
-
-    SqlitePool::connect_with(options).await
+async fn handle_sensor_message(payload_str: &str, pool: &SqlitePool) {
+    match serde_json::from_str::<TeleSensor>(payload_str) {
+        Ok(sensor) => {
+            if let Err(e) = save_sensor(pool, &sensor).await {
+                error!("Failed to save SENSOR: {e}");
+            } else {
+                debug!(
+                    "SENSOR saved: {}  P={}W V={}V",
+                    sensor.time,
+                    sensor.energy.power,
+                    sensor.energy.voltage
+                );
+            }
+        }
+        Err(e) => {
+            error!("Failed to parse SENSOR JSON: {e}");
+            error!("Payload: {payload_str}");
+        }
+    }
 }
 
 async fn save_state(pool: &SqlitePool, s: &TeleState) -> Result<(), sqlx::Error> {
