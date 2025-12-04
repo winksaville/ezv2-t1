@@ -7,8 +7,46 @@ Created with:
   https://chatgpt.com/share/6930bbf3-a5a8-800c-a89d-3719a0a5f58a
 - Claude Code: Added dynamic log level configuration, refactored into functions, and documentation
 
-Note: The `.claude` directory in this repo is symlinked from `~/.claude/projects/-home-wink-data-prgs-mqtt-ezv2-t1/`
-to preserve Claude conversation history within the repository.
+## Suggested Cloning procudure
+
+**I've placed this first I suggest a slightly different cloning technique.**
+
+Ideally the `.claude` directory in this repo is symlinked from `~/.claude/projects/<FullPath>-ezv2-t1/`
+to preserve Claude conversation history within the repository. Where FullPath is
+a claude compatible path with '/' replaced with '-'. So if the
+<FullPath> to ezv2-t1 is `/home/wink/data/prgs/mqtt/ezv2-t1` then
+`<FullPath>-ezv2-t1` is `-home-wink-data-prgs-mqtt-ezv2-t1`
+
+The suggested way to clone this repo is:
+```bash
+wink@3900x 25-12-04T19:16:30.500Z:~/data/prgs/mqtt
+$ git clone git@github.com:winksaville/ezv2-t1
+Cloning into 'ezv2-t1'...
+remote: Enumerating objects: 88, done.
+remote: Counting objects: 100% (88/88), done.
+remote: Compressing objects: 100% (30/30), done.
+remote: Total 88 (delta 43), reused 88 (delta 43), pack-reused 0 (from 0)
+Receiving objects: 100% (88/88), 224.16 KiB | 2.24 MiB/s, done.
+Resolving deltas: 100% (43/43), done.
+wink@3900x 25-12-04T19:16:39.843Z:~/data/prgs/mqtt
+$ cd ezv2-t1/
+wink@3900x 25-12-04T19:16:46.421Z:~/data/prgs/mqtt/ezv2-t1 (main)
+$ ln -sf $(pwd)/.claude ~/.claude/projects/-home-wink-data-prgs-mqtt-ezv2-t1
+```
+
+And you can verify the symlink using diff:
+```bash
+wink@3900x 25-12-04T19:17:06.452Z:~/data/prgs/mqtt/ezv2-t1 (main)
+$ diff ~/.claude/projects/-home-wink-data-prgs-mqtt-ezv2-t1 .claude
+wink@3900x 25-12-04T19:17:26.983Z:~/data/prgs/mqtt/ezv2-t1 (main)
+$ echo $?
+0
+wink@3900x 25-12-04T19:17:32.087Z:~/data/prgs/mqtt/ezv2-t1 (main
+```
+
+Note: if you endup with a `.claude/.claude` symlink it means
+that `~/.claude/projects/<FullPath>-ezv2-t1` already existed,
+just delete the redundant symlink `rm .claude/.claude`
 
 ## What It Does
 
