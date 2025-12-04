@@ -100,27 +100,42 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
     // Spawn file watcher in a separate thread (notify requires blocking)
+    let tx_clone = tx.clone();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Handle::current();
-
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<NotifyEvent, notify::Error>| {
                 if let Ok(event) = res {
-                    // Trigger reload on modify or create events
-                    if event.kind.is_modify() || event.kind.is_create() {
-                        let _ = rt.block_on(async {
-                            tx.send(()).await
-                        });
+                    // Check if event is related to log_config.txt
+                    let is_log_config = event.paths.iter().any(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n == "log_config.txt")
+                            .unwrap_or(false)
+                    });
+
+                    if is_log_config {
+                        eprintln!("DEBUG: File event: {:?} (is_modify={}, is_create={}, is_remove={})",
+                            event.kind, event.kind.is_modify(), event.kind.is_create(), event.kind.is_remove());
+                        // Trigger reload on close-write, create, or remove events
+                        // Note: We use Access(Close(Write)) instead of Modify to avoid duplicate events
+                        // from truncate + write generating two separate Modify(Data) inotify events
+                        let is_close_write = matches!(event.kind, notify::EventKind::Access(notify::event::AccessKind::Close(notify::event::AccessMode::Write)));
+                        if is_close_write || event.kind.is_create() || event.kind.is_remove() {
+                            eprintln!("DEBUG: Sending reload signal");
+                            let _ = tx_clone.blocking_send(());
+                        }
                     }
                 }
             },
             Config::default(),
         ).expect("Failed to create file watcher");
 
+        // Watch the current directory instead of the file directly
+        // This allows us to detect file creation/deletion
         watcher.watch(
-            std::path::Path::new("log_config.txt"),
+            std::path::Path::new("."),
             RecursiveMode::NonRecursive
-        ).expect("Failed to watch log_config.txt");
+        ).expect("Failed to watch current directory");
 
         // Keep watcher alive
         loop {
@@ -131,6 +146,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     // Handle reload events
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
+            eprintln!("DEBUG: Received reload event");
             // Read log level from file
             match fs::read_to_string("log_config.txt") {
                 Ok(content) => {
@@ -154,7 +170,10 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to read log_config.txt: {e}");
+                    // If file doesn't exist, just ignore (keep current log level)
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        error!("Failed to read log_config.txt: {e}");
+                    }
                 }
             }
         }
