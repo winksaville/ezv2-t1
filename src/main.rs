@@ -87,17 +87,20 @@ type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize logging with dynamic reload support
     let reload_handle = init_tracing();
     spawn_config_watcher(reload_handle);
 
     info!("ezv2: SQLite Logger starting");
 
+    // Set up database and MQTT connections
     let pool = init_db("ezplug.db").await?;
     let (_client, mut eventloop) = setup_mqtt().await?;
 
     let state_topic = format!("tele/{TOPIC_BASE}/STATE");
     let sensor_topic = format!("tele/{TOPIC_BASE}/SENSOR");
 
+    // Main event loop: process incoming MQTT messages
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(p))) => {
@@ -114,7 +117,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     warn!("Other topic {} => {}", topic, payload_str);
                 }
             }
-            Ok(_) => {}
+            Ok(_) => {} // Ignore pings, acks, etc.
             Err(e) => {
                 error!("MQTT error: {e}");
                 return Err(e.into());
@@ -123,6 +126,8 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Initialize tracing subscriber with a reloadable filter layer.
+/// Returns a handle that can be used to dynamically change the log level.
 fn init_tracing() -> ReloadHandle {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
@@ -137,6 +142,8 @@ fn init_tracing() -> ReloadHandle {
     reload_handle
 }
 
+/// Watch log_config.txt for changes and reload the tracing filter when modified.
+/// Spawns a file watcher thread and a tokio task to handle reload events.
 fn spawn_config_watcher(reload_handle: ReloadHandle) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(10);
 
@@ -217,6 +224,7 @@ fn spawn_config_watcher(reload_handle: ReloadHandle) {
     });
 }
 
+/// Connect to SQLite database and create tables if they don't exist.
 async fn init_db(filename: impl AsRef<Path>) -> Result<SqlitePool, Box<dyn Error>> {
     info!("ezv2: connect_to_db({})", filename.as_ref().display());
     let options = SqliteConnectOptions::new()
@@ -273,6 +281,7 @@ async fn init_db(filename: impl AsRef<Path>) -> Result<SqlitePool, Box<dyn Error
     Ok(pool)
 }
 
+/// Set up MQTT client, subscribe to topics, and configure telemetry period.
 async fn setup_mqtt() -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
     info!("Setting up MQTT client");
     let mut mqttoptions =
@@ -304,6 +313,7 @@ async fn setup_mqtt() -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
     Ok((client, eventloop))
 }
 
+/// Parse and save a STATE message to the database.
 async fn handle_state_message(payload_str: &str, pool: &SqlitePool) {
     match serde_json::from_str::<TeleState>(payload_str) {
         Ok(state) => {
@@ -320,6 +330,7 @@ async fn handle_state_message(payload_str: &str, pool: &SqlitePool) {
     }
 }
 
+/// Parse and save a SENSOR message to the database.
 async fn handle_sensor_message(payload_str: &str, pool: &SqlitePool) {
     match serde_json::from_str::<TeleSensor>(payload_str) {
         Ok(sensor) => {
@@ -341,6 +352,7 @@ async fn handle_sensor_message(payload_str: &str, pool: &SqlitePool) {
     }
 }
 
+/// Insert a TeleState record into the state table.
 async fn save_state(pool: &SqlitePool, s: &TeleState) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
@@ -367,6 +379,7 @@ async fn save_state(pool: &SqlitePool, s: &TeleState) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// Insert a TeleSensor record into the sensor table.
 async fn save_sensor(pool: &SqlitePool, s: &TeleSensor) -> Result<(), sqlx::Error> {
     let e = &s.energy;
     sqlx::query(
