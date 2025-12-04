@@ -114,14 +114,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     });
 
                     if is_log_config {
-                        eprintln!("DEBUG: File event: {:?} (is_modify={}, is_create={}, is_remove={})",
-                            event.kind, event.kind.is_modify(), event.kind.is_create(), event.kind.is_remove());
                         // Trigger reload on close-write, create, or remove events
                         // Note: We use Access(Close(Write)) instead of Modify to avoid duplicate events
                         // from truncate + write generating two separate Modify(Data) inotify events
                         let is_close_write = matches!(event.kind, notify::EventKind::Access(notify::event::AccessKind::Close(notify::event::AccessMode::Write)));
                         if is_close_write || event.kind.is_create() || event.kind.is_remove() {
-                            eprintln!("DEBUG: Sending reload signal");
                             let _ = tx_clone.blocking_send(());
                         }
                     }
@@ -146,7 +143,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     // Handle reload events
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
-            eprintln!("DEBUG: Received reload event");
             // Read log level from file
             match fs::read_to_string("log_config.txt") {
                 Ok(content) => {
