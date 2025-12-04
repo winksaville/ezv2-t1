@@ -66,29 +66,53 @@ cargo build --release  # Release build
 
 ## Running
 
-```bash
-cargo run
-```
-
-Or run the built binary directly:
+### Collector
 
 ```bash
-./target/release/ezv2-t1
+cargo run -p collector
 ```
 
-The application will:
+The collector will:
 1. Create `ezplug.db` if it doesn't exist
 2. Connect to the MQTT broker at 192.168.1.195:1883
 3. Subscribe to telemetry topics and begin logging data
 
+### Viewer
+
+Plot power data from the database to a PNG file:
+
+```bash
+cargo run -p viewer -- <db_file> <output.png> [start] [count]
+```
+
+Arguments:
+- `db_file` - Path to the SQLite database
+- `output.png` - Output PNG file path
+- `start` - Starting row ID (default: 0)
+- `count` - Number of points to plot (default: 100)
+
+Example:
+```bash
+cargo run -p viewer -- ezplug.db power.png 0 500
+```
+
 ## Configuration
 
-The broker IP, port, and device topic are configured as constants in `src/main.rs`:
+The application is configured via `ezv2-config.toml`:
 
-```rust
-const BROKER_IP: &str = "192.168.1.195";
-const BROKER_PORT: u16 = 1883;
-const TOPIC_BASE: &str = "EZPlugV2_743EEC";
+```toml
+[mqtt]
+broker_ip = "192.168.1.195"
+broker_port = 1883
+topic_base = "EZPlugV2_743EEC"
+client_id = "ezplugv2_sqlite_logger_dev"
+tele_period = 10  # Telemetry interval in seconds (10-3600)
+
+[database]
+filename = "ezplug.db"
+
+[logging]
+config_file = "log_config.txt"  # File for dynamic log level changes
 ```
 
 ## Dynamic Log Levels
