@@ -3,116 +3,17 @@
 use std::time::Duration;
 use std::{error::Error, fs, path::Path};
 
+use config::{MqttConfig, load_config};
+use database::{TeleSensor, TeleState, init_db, save_sensor, save_state};
 use notify::{Config, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use rumqttc::{AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS};
-use serde::Deserialize;
-use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::SqlitePool;
 use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::{EnvFilter, prelude::*, reload};
 
 const CONFIG_FILE: &str = "ezv2-config.toml";
 
-#[derive(Debug, Deserialize)]
-struct AppConfig {
-    mqtt: MqttConfig,
-    database: DatabaseConfig,
-    logging: LoggingConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct MqttConfig {
-    broker_ip: String,
-    broker_port: u16,
-    topic_base: String,
-    client_id: String,
-    tele_period: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DatabaseConfig {
-    filename: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoggingConfig {
-    config_file: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Wifi {
-    #[serde(rename = "SSId")]
-    ssid: String,
-    #[serde(rename = "RSSI")]
-    rssi: i32,
-}
-
-#[derive(Debug, Deserialize)]
-struct TeleState {
-    #[serde(rename = "Time")]
-    time: String,
-    #[serde(rename = "Uptime")]
-    uptime: String,
-    #[serde(rename = "UptimeSec")]
-    uptime_sec: u64,
-    #[serde(rename = "Heap")]
-    heap: u32,
-    #[serde(rename = "SleepMode")]
-    sleep_mode: String,
-    #[serde(rename = "Sleep")]
-    sleep: u32,
-    #[serde(rename = "LoadAvg")]
-    load_avg: u32,
-    #[serde(rename = "MqttCount")]
-    mqtt_count: u32,
-    #[serde(rename = "POWER1")]
-    power1: String,
-    #[serde(rename = "Wifi")]
-    wifi: Wifi,
-}
-
-#[derive(Debug, Deserialize)]
-struct Energy {
-    #[serde(rename = "TotalStartTime")]
-    total_start_time: String,
-    #[serde(rename = "Total")]
-    total: f64,
-    #[serde(rename = "Yesterday")]
-    yesterday: f64,
-    #[serde(rename = "Today")]
-    today: f64,
-    #[serde(rename = "Period")]
-    period: i64,
-    #[serde(rename = "Power")]
-    power: f64,
-    #[serde(rename = "ApparentPower")]
-    apparent_power: f64,
-    #[serde(rename = "ReactivePower")]
-    reactive_power: f64,
-    #[serde(rename = "Factor")]
-    factor: f64,
-    #[serde(rename = "Voltage")]
-    voltage: i64,
-    #[serde(rename = "Current")]
-    current: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct TeleSensor {
-    #[serde(rename = "Time")]
-    time: String,
-    #[serde(rename = "ENERGY")]
-    energy: Energy,
-}
-
 type ReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
-
-fn load_config() -> Result<AppConfig, Box<dyn Error>> {
-    let content = fs::read_to_string(CONFIG_FILE)
-        .map_err(|e| format!("Failed to read {CONFIG_FILE}: {e}"))?;
-    let config: AppConfig =
-        toml::from_str(&content).map_err(|e| format!("Failed to parse {CONFIG_FILE}: {e}"))?;
-    Ok(config)
-}
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
@@ -120,7 +21,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     let reload_handle = init_tracing();
 
     // Load configuration
-    let config = load_config()?;
+    let config = load_config(CONFIG_FILE)?;
     info!("Loaded configuration from {CONFIG_FILE}");
 
     spawn_config_watcher(reload_handle, config.logging.config_file.clone());
@@ -278,63 +179,6 @@ fn spawn_config_watcher(reload_handle: ReloadHandle, log_config_file: String) {
     });
 }
 
-/// Connect to SQLite database and create tables if they don't exist.
-async fn init_db(filename: impl AsRef<Path>) -> Result<SqlitePool, Box<dyn Error>> {
-    info!("ezv2: connect_to_db({})", filename.as_ref().display());
-    let options = SqliteConnectOptions::new()
-        .filename(&filename)
-        .create_if_missing(true);
-    let pool = SqlitePool::connect_with(options).await?;
-    info!("ezv2: connected to {}", filename.as_ref().display());
-
-    info!("Create/connect to state table");
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS state (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            time        TEXT NOT NULL,
-            uptime      TEXT NOT NULL,
-            uptime_sec  INTEGER NOT NULL,
-            heap        INTEGER NOT NULL,
-            sleep_mode  TEXT NOT NULL,
-            sleep       INTEGER NOT NULL,
-            load_avg    INTEGER NOT NULL,
-            mqtt_count  INTEGER NOT NULL,
-            power1      TEXT NOT NULL,
-            wifi_ssid   TEXT NOT NULL,
-            wifi_rssi   INTEGER NOT NULL
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    info!("Create/connect to sensor table");
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sensor (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            time             TEXT NOT NULL,
-            total_start_time TEXT NOT NULL,
-            total            REAL NOT NULL,
-            yesterday        REAL NOT NULL,
-            today            REAL NOT NULL,
-            period           INTEGER NOT NULL,
-            power            REAL NOT NULL,
-            apparent_power   REAL NOT NULL,
-            reactive_power   REAL NOT NULL,
-            factor           REAL NOT NULL,
-            voltage          INTEGER NOT NULL,
-            current          REAL NOT NULL
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    Ok(pool)
-}
-
 /// Set up MQTT client, subscribe to topics, and configure telemetry period.
 async fn setup_mqtt(config: &MqttConfig) -> Result<(AsyncClient, EventLoop), Box<dyn Error>> {
     info!("Setting up MQTT client");
@@ -404,60 +248,4 @@ async fn handle_sensor_message(payload_str: &str, pool: &SqlitePool) {
             error!("Payload: {payload_str}");
         }
     }
-}
-
-/// Insert a TeleState record into the state table.
-async fn save_state(pool: &SqlitePool, s: &TeleState) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO state (
-            time, uptime, uptime_sec, heap,
-            sleep_mode, sleep, load_avg, mqtt_count,
-            power1, wifi_ssid, wifi_rssi
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-        "#,
-    )
-    .bind(&s.time)
-    .bind(&s.uptime)
-    .bind(s.uptime_sec as i64)
-    .bind(s.heap as i64)
-    .bind(&s.sleep_mode)
-    .bind(s.sleep as i64)
-    .bind(s.load_avg as i64)
-    .bind(s.mqtt_count as i64)
-    .bind(&s.power1)
-    .bind(&s.wifi.ssid)
-    .bind(s.wifi.rssi)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Insert a TeleSensor record into the sensor table.
-async fn save_sensor(pool: &SqlitePool, s: &TeleSensor) -> Result<(), sqlx::Error> {
-    let e = &s.energy;
-    sqlx::query(
-        r#"
-        INSERT INTO sensor (
-            time, total_start_time, total, yesterday, today,
-            period, power, apparent_power, reactive_power,
-            factor, voltage, current
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-        "#,
-    )
-    .bind(&s.time)
-    .bind(&e.total_start_time)
-    .bind(e.total)
-    .bind(e.yesterday)
-    .bind(e.today)
-    .bind(e.period)
-    .bind(e.power)
-    .bind(e.apparent_power)
-    .bind(e.reactive_power)
-    .bind(e.factor)
-    .bind(e.voltage)
-    .bind(e.current)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
